@@ -1,4 +1,5 @@
-import { Client, GatewayIntentBits } from 'discord.js';
+import { Client, GatewayIntentBits, Message } from 'discord.js';
+import { postToTwitter } from './twitter-service';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -18,13 +19,15 @@ const client = new Client({
   ],
 });
 
-const AGENT_ID = "b850bc30-45f8-0041-a00a-83df46d8555d";
+const AGENT_ID = process.env.AGENT_ID || "b850bc30-45f8-0041-a00a-83df46d8555d";
+const AGENT_URL = process.env.AGENT_URL || "http://localhost:3000";
+const ALLOWED_ROLE_NAME = process.env.ALLOWED_ROLE_NAME || "Twitter Manager";
 
 client.once('ready', () => {
   console.log(`Logged in as ${client.user?.tag}`);
 });
 
-client.on('messageCreate', async (message) => {
+client.on('messageCreate', async (message: Message) => {
   // Ignore bot messages
   if (message.author.bot) return;
   
@@ -32,54 +35,139 @@ client.on('messageCreate', async (message) => {
     console.log('----------------------');
     console.log('Received message:', message.content);
 
-    const response = await fetch(`http://localhost:3000/${AGENT_ID}/message`, {
+    // Check if user has the required role for !tweet commands
+    const hasRequiredRole = message.member?.roles.cache.some(role => role.name === ALLOWED_ROLE_NAME);
+
+    // Handle direct !tweet command
+    if (message.content.startsWith('!tweet ')) {
+      if (!hasRequiredRole) {
+        await message.reply({
+          content: `❌ You need the "${ALLOWED_ROLE_NAME}" role to use the !tweet command.`,
+          failIfNotExists: false
+        });
+        return;
+      }
+
+      // Get the content after !tweet
+      const tweetContent = message.content.slice(7).trim();
+      
+      // Post directly to Twitter
+      const tweetResult = await postToTwitter(tweetContent);
+      
+      if (tweetResult.success) {
+        await message.reply(
+          `✅ I've posted your message on Twitter!\n📱 View the tweet: https://twitter.com/x/status/${tweetResult.tweetId}`
+        );
+      } else {
+        await message.reply(
+          `❌ Failed to post to Twitter: ${tweetResult.error}`
+        );
+      }
+      return;
+    }
+
+    // Check if this is a reply to the bot's message with !tweet command
+    if (message.reference && message.content.includes('!tweet')) {
+      if (!hasRequiredRole) {
+        await message.reply({
+          content: `❌ You need the "${ALLOWED_ROLE_NAME}" role to use the !tweet command.`,
+          failIfNotExists: false
+        });
+        return;
+      }
+
+      // Fetch the message being replied to
+      const repliedMessage = await message.channel.messages.fetch(message.reference.messageId!);
+      
+      // Check if it's a reply to the bot's message
+      if (repliedMessage.author.id === client.user!.id) {
+        // Post the bot's original response to Twitter
+        const tweetResult = await postToTwitter(repliedMessage.content);
+        
+        if (tweetResult.success) {
+          await message.reply(
+            `✅ I've posted my response on Twitter!\n📱 View the tweet: https://twitter.com/x/status/${tweetResult.tweetId}`
+          );
+        } else {
+          await message.reply(
+            `❌ Failed to post my response to Twitter: ${tweetResult.error}`
+          );
+        }
+        return;
+      }
+    }
+
+    // Only process other messages that mention the bot
+    if (!message.mentions.has(client.user!)) return;
+
+    // Remove the bot mention from the message content
+    const content = message.content.replace(/<@!\d+>|<@\d+>/g, '').trim();
+
+    // Handle regular chat messages
+    const response = await fetch(`${AGENT_URL}/${AGENT_ID}/message`, {
       method: 'POST',
       headers: { 
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ 
-        text: message.content,
+        text: content,
         userId: message.author.id,
         userName: message.author.username
       }),
     });
-
-    console.log('API Response Status:', response.status);
 
     if (!response.ok) {
       throw new Error(`API responded with status: ${response.status}`);
     }
 
     const rawResponse = await response.text();
-    console.log('Raw API Response:', rawResponse);
-
     const data = JSON.parse(rawResponse) as ApiResponse[];
-    console.log('Parsed API Response:', data);
 
     let replyText: string | null = null;
 
-    // Check if the response is an array
     if (Array.isArray(data)) {
       const firstResponse = data[0];
       if (firstResponse) {
         replyText = firstResponse.text || firstResponse.message || firstResponse.response || null;
       }
     } else {
-      // If not an array, try as single object
       const singleResponse = data as unknown as ApiResponse;
       replyText = singleResponse.text || singleResponse.message || singleResponse.response || null;
     }
 
-    // Check if we got a valid reply text
     if (!replyText) {
       throw new Error('No valid response text found in API response');
     }
 
-    // Send the reply with the guaranteed string
-    await message.reply({
-      content: replyText,
-      failIfNotExists: false
-    });
+    // Check if this is a mention with !tweet command
+    if (content.includes('!tweet')) {
+      if (!hasRequiredRole) {
+        await message.reply({
+          content: `❌ You need the "${ALLOWED_ROLE_NAME}" role to use the !tweet command.`,
+          failIfNotExists: false
+        });
+        return;
+      }
+
+      // Post bot's response to Twitter
+      const tweetResult = await postToTwitter(replyText);
+      
+      if (tweetResult.success) {
+        await message.reply(
+          `✅ I've posted my response on Twitter!\n📱 View the tweet: https://twitter.com/x/status/${tweetResult.tweetId}`
+        );
+      } else {
+        await message.reply(
+          `❌ Failed to post my response to Twitter: ${tweetResult.error}`
+        );
+      }
+    } else {
+      // Send normal Discord reply for non-tweet mentions
+      await message.reply({
+        content: replyText,
+        failIfNotExists: false
+      });
+    }
 
   } catch (error) {
     console.error('Error details:', {
@@ -92,8 +180,6 @@ client.on('messageCreate', async (message) => {
         (error instanceof Error ? error.message : 'Unknown error'),
       failIfNotExists: false
     });
-  } finally {
-    console.log('----------------------');
   }
 });
 
